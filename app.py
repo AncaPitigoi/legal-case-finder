@@ -27,8 +27,6 @@ def get_api_token():
     """Get API token from Streamlit secrets or sidebar input."""
     token = st.secrets.get("COURTLISTENER_API_TOKEN", None)
     if token:
-        # DEBUG: show that we actually loaded something (first 4 chars only)
-        st.sidebar.write(f"Loaded token starting with: {token[:4]}***")
         return token
 
     token = st.sidebar.text_input(
@@ -37,6 +35,7 @@ def get_api_token():
         help="Paste your CourtListener API token here if not using st.secrets."
     )
     return token.strip() if token else None
+
 
 def make_headers(token: str):
     return {
