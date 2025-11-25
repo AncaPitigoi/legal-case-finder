@@ -38,6 +38,12 @@ def get_api_token():
     )
     return token.strip() if token else None
 
+def make_headers(token: str):
+    return {
+        "Authorization": f"Token {token}",
+        "Accept": "application/json",
+    }
+
 
 # -----------------------------
 # SIMPLE NLP UTILITIES
