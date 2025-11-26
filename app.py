@@ -104,13 +104,9 @@ def strip_xml_tags(xml: str) -> str:
 # -----------------------------
 
 def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str | None = None):
-    """
-    Search CourtListener case law (opinions) using API v4.
-    Returns a list of dicts with metadata for each result.
-    """
     params = {
         "q": query,
-        "type": "o",     # v4 uses descriptive type names
+        "type": "o",          # opinions
         "page_size": page_size,
     }
     if jurisdiction and jurisdiction != "all":
@@ -122,43 +118,46 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
 
     results = []
     for item in data.get("results", []):
+        # 1) Try the id field first
         opinion_id = item.get("id")
 
-        # Case name: v4 uses case_name
-        case_name = item.get("case_name") or item.get("caseName") or "Unknown case name"
+        # 2) If it's missing/None, try to extract from absolute_url
+        if opinion_id is None:
+            abs_url = item.get("absolute_url") or ""
+            m = re.search(r"/opinion/(\d+)/", abs_url)
+            if m:
+                opinion_id = int(m.group(1))
 
-        # Citations: sometimes a list, sometimes a string
+        # 3) If we *still* don't have an id, just skip this result
+        if opinion_id is None:
+            continue
+
+        case_name = item.get("case_name") or "Unknown case name"
+
         cites = item.get("citation") or item.get("citations")
         if isinstance(cites, list):
             citation = cites[0] if cites else "No citation"
         else:
             citation = cites or "No citation"
 
-        # Court: can be a dict or a string
         court_field = item.get("court")
-        court_name = None
         if isinstance(court_field, dict):
             court_name = court_field.get("name") or court_field.get("court_name")
         else:
             court_name = court_field
-        court_name = court_name or item.get("court_name") or item.get("court_citation_string") or "Unknown court"
+        court_name = court_name or item.get("court_name") or "Unknown court"
 
-        # Date filed: v4 usually uses date_filed
         date = item.get("date_filed") or item.get("dateFiled") or item.get("date") or "Unknown date"
 
-        # Web URL – absolute_url is provided in search results
-        abs_url = item.get("absolute_url")
-        if abs_url:
-            if abs_url.startswith("http"):
-                web_url = abs_url
-            else:
-                web_url = "https://www.courtlistener.com" + abs_url
+        abs_url = item.get("absolute_url") or f"/opinion/{opinion_id}/"
+        if abs_url.startswith("http"):
+            web_url = abs_url
         else:
-            web_url = f"https://www.courtlistener.com/opinion/{opinion_id}/"
+            web_url = "https://www.courtlistener.com" + abs_url
 
         results.append(
             {
-                "id": opinion_id,
+                "id": opinion_id,              # now guaranteed to be an int
                 "case_name": case_name,
                 "citation": citation,
                 "court": court_name,
@@ -175,6 +174,8 @@ def get_opinion_text(token: str, opinion_id: int):
     Get full text of an opinion via /opinions/{id}/ in API v4.
     Tries plain_text, then html, then xml_harvard.
     """
+    if opinion_id is None:
+    return "No opinion ID available for this result."
     url = f"{BASE_URL}/opinions/{opinion_id}/"
     r = requests.get(url, headers=make_headers(token))
     r.raise_for_status()
@@ -203,7 +204,7 @@ def get_opinion_text(token: str, opinion_id: int):
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
 
-    st.title("🔎 Legal Case Finder (CourtListener, API v4)")
+    st.title("🔎 Legal Case Finder (CourtListener)")
     st.write(
         "Describe a legal scenario, and this app retrieves **similar cases** using the "
         "CourtListener API v4 and light NLP for keyword extraction, similarity scoring, "
