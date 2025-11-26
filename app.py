@@ -118,28 +118,52 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
 
     results = []
     for item in data.get("results", []):
-        # 1) Try the id field first
+        # --- ID handling (as we fixed before) ---
         opinion_id = item.get("id")
-
-        # 2) If it's missing/None, try to extract from absolute_url
-        if opinion_id is None:
-            abs_url = item.get("absolute_url") or ""
+        abs_url = item.get("absolute_url") or ""
+        if opinion_id is None and abs_url:
             m = re.search(r"/opinion/(\d+)/", abs_url)
             if m:
                 opinion_id = int(m.group(1))
-
-        # 3) If we *still* don't have an id, just skip this result
         if opinion_id is None:
+            # Skip if we really cannot determine the ID
             continue
 
-        case_name = item.get("case_name") or "Unknown case name"
+        # --- CASE NAME HANDLING ---
+        case_name = item.get("case_name") or item.get("caseName")
 
+        # If still missing, try cluster/docket objects
+        if not case_name:
+            cluster = item.get("cluster") or {}
+            if isinstance(cluster, dict):
+                case_name = cluster.get("case_name") or cluster.get("caseName")
+
+        if not case_name:
+            docket = item.get("docket") or {}
+            if isinstance(docket, dict):
+                case_name = docket.get("case_name") or docket.get("caseName")
+
+        # If still missing, derive from URL slug: /opinion/5302688/schindler-elevator-corporation-v-darren-ceasar/
+        if not case_name and abs_url:
+            m = re.search(r"/opinion/\d+/(.*?)/?$", abs_url)
+            if m:
+                slug = m.group(1)
+                # Make it nicer: replace dashes with spaces, title-case it
+                case_name = slug.replace("-", " ").title()
+                # Optional: fix " V " to " v. "
+                case_name = case_name.replace(" V ", " v. ")
+
+        if not case_name:
+            case_name = "Unknown case name"
+
+        # --- Citation ---
         cites = item.get("citation") or item.get("citations")
         if isinstance(cites, list):
             citation = cites[0] if cites else "No citation"
         else:
             citation = cites or "No citation"
 
+        # --- Court ---
         court_field = item.get("court")
         if isinstance(court_field, dict):
             court_name = court_field.get("name") or court_field.get("court_name")
@@ -147,17 +171,21 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
             court_name = court_field
         court_name = court_name or item.get("court_name") or "Unknown court"
 
+        # --- Date ---
         date = item.get("date_filed") or item.get("dateFiled") or item.get("date") or "Unknown date"
 
-        abs_url = item.get("absolute_url") or f"/opinion/{opinion_id}/"
-        if abs_url.startswith("http"):
-            web_url = abs_url
+        # --- Web URL for user ---
+        if abs_url:
+            if abs_url.startswith("http"):
+                web_url = abs_url
+            else:
+                web_url = "https://www.courtlistener.com" + abs_url
         else:
-            web_url = "https://www.courtlistener.com" + abs_url
+            web_url = f"https://www.courtlistener.com/opinion/{opinion_id}/"
 
         results.append(
             {
-                "id": opinion_id,              # now guaranteed to be an int
+                "id": opinion_id,
                 "case_name": case_name,
                 "citation": citation,
                 "court": court_name,
