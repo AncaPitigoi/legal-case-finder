@@ -1,5 +1,3 @@
-
-import math
 import re
 import textwrap
 from collections import Counter
@@ -23,10 +21,17 @@ STOPWORDS = {
     "about", "into", "over", "under", "between", "because", "up", "down"
 }
 
+
 def get_api_token():
-    """Get API token from Streamlit secrets or sidebar input."""
+    """
+    Get API token from Streamlit secrets or sidebar input.
+    If COURTLISTENER_API_TOKEN exists in st.secrets, use that.
+    Otherwise, show a password field in the sidebar.
+    """
     token = st.secrets.get("COURTLISTENER_API_TOKEN", None)
     if token:
+        # Debug helper – shows only first few chars so you know it's loaded.
+        st.sidebar.write(f"Loaded token starting with: {token[:4]}***")
         return token
 
     token = st.sidebar.text_input(
@@ -63,7 +68,6 @@ def extract_keywords(text: str, top_n: int = 10):
         return []
 
     counts = Counter(tokens)
-    # most common tokens as "keywords"
     return [w for w, _ in counts.most_common(top_n)]
 
 
@@ -85,18 +89,28 @@ def summarize_text(text: str, max_sentences: int = 3):
     return summary
 
 
+def strip_xml_tags(xml: str) -> str:
+    """
+    Very rough stripper for xml_harvard content.
+    Just removes <...> tags and compresses whitespace.
+    """
+    no_tags = re.sub(r"<[^>]+>", " ", xml)
+    no_tags = re.sub(r"\s+", " ", no_tags)
+    return no_tags.strip()
+
+
 # -----------------------------
-# COURTLISTENER HELPERS
+# COURTLISTENER HELPERS (v4)
 # -----------------------------
 
 def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str | None = None):
     """
-    Search CourtListener case law (opinions).
-    Returns a list of dicts with metadata.
+    Search CourtListener case law (opinions) using API v4.
+    Returns a list of dicts with metadata for each result.
     """
     params = {
         "q": query,
-        "type": "o",       # 'o' = opinions
+        "type": "opinion",     # v4 uses descriptive type names
         "page_size": page_size,
     }
     if jurisdiction and jurisdiction != "all":
@@ -109,17 +123,30 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
     results = []
     for item in data.get("results", []):
         opinion_id = item.get("id")
-        case_name = item.get("caseName") or item.get("case_name") or "Unknown case name"
-        citation = item.get("citation") or item.get("citations") or "No citation"
 
-        court_field = item.get("court")
-        if isinstance(court_field, dict):
-            court_name = court_field.get("name")
+        # Case name: v4 uses case_name
+        case_name = item.get("case_name") or item.get("caseName") or "Unknown case name"
+
+        # Citations: sometimes a list, sometimes a string
+        cites = item.get("citation") or item.get("citations")
+        if isinstance(cites, list):
+            citation = cites[0] if cites else "No citation"
         else:
-            court_name = court_field or "Unknown court"
+            citation = cites or "No citation"
 
-        date = item.get("dateFiled") or item.get("filed") or item.get("date") or "Unknown date"
+        # Court: can be a dict or a string
+        court_field = item.get("court")
+        court_name = None
+        if isinstance(court_field, dict):
+            court_name = court_field.get("name") or court_field.get("court_name")
+        else:
+            court_name = court_field
+        court_name = court_name or item.get("court_name") or item.get("court_citation_string") or "Unknown court"
 
+        # Date filed: v4 usually uses date_filed
+        date = item.get("date_filed") or item.get("dateFiled") or item.get("date") or "Unknown date"
+
+        # Web URL – absolute_url is provided in search results
         abs_url = item.get("absolute_url")
         if abs_url:
             if abs_url.startswith("http"):
@@ -127,8 +154,6 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
             else:
                 web_url = "https://www.courtlistener.com" + abs_url
         else:
-            # Fallback based on documented pattern: /opinion/<id>/
-            # See CourtListener search/operator docs.
             web_url = f"https://www.courtlistener.com/opinion/{opinion_id}/"
 
         results.append(
@@ -146,7 +171,10 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
 
 
 def get_opinion_text(token: str, opinion_id: int):
-    """Get plain text of an opinion from /opinions/{id}/."""
+    """
+    Get full text of an opinion via /opinions/{id}/ in API v4.
+    Tries plain_text, then html, then xml_harvard.
+    """
     url = f"{BASE_URL}/opinions/{opinion_id}/"
     r = requests.get(url, headers=make_headers(token))
     r.raise_for_status()
@@ -156,8 +184,16 @@ def get_opinion_text(token: str, opinion_id: int):
     if text:
         return text
 
-    # fallback to HTML if no plain text
-    return data.get("html") or "No opinion text available."
+    html = data.get("html")
+    if html:
+        # You could keep HTML, but for now just return it verbatim.
+        return html
+
+    xml = data.get("xml_harvard")
+    if xml:
+        return strip_xml_tags(xml)
+
+    return "No opinion text available."
 
 
 # -----------------------------
@@ -167,14 +203,13 @@ def get_opinion_text(token: str, opinion_id: int):
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
 
-    st.title("🔎 Legal Case Finder (CourtListener)")
+    st.title("🔎 Legal Case Finder (CourtListener, API v4)")
     st.write(
-        "Describe a legal scenario in everyday language, and this app will search "
-        "CourtListener for **similar cases**. Results are lightly processed with NLP "
-        "for keyword extraction, simple similarity re-ranking, and short summaries."
+        "Describe a legal scenario, and this app retrieves **similar cases** using the "
+        "CourtListener API v4 and light NLP for keyword extraction, similarity scoring, "
+        "and naive summaries."
     )
 
-    # Sidebar config
     st.sidebar.header("Settings")
 
     token = get_api_token()
@@ -186,7 +221,7 @@ def main():
         "Jurisdiction filter",
         options=["All", "New York (ny)", "California (ca)", "Federal (us)"],
         index=0,
-        help="Optional: limit search to a jurisdiction."
+        help="Optional: Restrict to a jurisdiction. Leave as 'All' to search broadly."
     )
     jurisdiction_map = {
         "All": "all",
@@ -205,15 +240,14 @@ def main():
     )
 
     use_rerank = st.sidebar.checkbox(
-        "Use NLP re-ranking (slightly slower)",
+        "Use NLP re-ranking (keyword overlap)",
         value=True,
         help="Rerank API results using keyword overlap between your description and each opinion."
     )
 
-    # Main input area
     st.subheader("Describe Your Case")
     user_desc = st.text_area(
-        "Describe the facts, issues, and context of your case:",
+        "Facts, issues, and context:",
         height=150,
         placeholder="Example: My client slipped on ice outside a supermarket, "
                     "store knew about the hazard, premises liability, New York..."
@@ -224,17 +258,17 @@ def main():
             st.warning("Please enter a description first.")
             st.stop()
 
-        with st.spinner("Searching CourtListener..."):
-            try:
+        try:
+            with st.spinner("Searching CourtListener (v4)..."):
                 base_results = search_cases(
                     token=token,
                     query=user_desc,
                     page_size=num_results,
                     jurisdiction=jurisdiction,
                 )
-            except Exception as e:
-                st.error(f"Error while searching CourtListener: {e}")
-                st.stop()
+        except Exception as e:
+            st.error(f"Error while searching CourtListener: {e}")
+            st.stop()
 
         if not base_results:
             st.info("No matching cases found.")
@@ -248,7 +282,6 @@ def main():
         else:
             st.write("_No significant keywords detected (input may be too short)._")
 
-        # Fetch opinion texts & compute similarity scores if enabled
         enriched_results = []
         if use_rerank:
             st.info(
@@ -263,10 +296,8 @@ def main():
             except Exception as e:
                 text = f"Error retrieving opinion text: {e}"
 
-            # Simple summary
             summary = summarize_text(text, max_sentences=3)
 
-            # Similarity score (Jaccard on tokens)
             if use_rerank:
                 case_tokens = tokenize(text)
                 score = jaccard_score(user_keywords, case_tokens)
