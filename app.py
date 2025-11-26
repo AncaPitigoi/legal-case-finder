@@ -11,7 +11,7 @@ import streamlit as st
 # API & CONFIG
 # -----------------------------
 
-BASE_URL = "https://www.courtlistener.com/api/rest/v3"
+BASE_URL = "https://www.courtlistener.com/api/rest/v4"
 
 # Minimal English stopword list for simple NLP
 STOPWORDS = {
