@@ -110,7 +110,7 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
     """
     params = {
         "q": query,
-        "type": "opinion",     # v4 uses descriptive type names
+        "type": "o",     # v4 uses descriptive type names
         "page_size": page_size,
     }
     if jurisdiction and jurisdiction != "all":
