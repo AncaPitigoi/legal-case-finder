@@ -175,7 +175,7 @@ def get_opinion_text(token: str, opinion_id: int):
     Tries plain_text, then html, then xml_harvard.
     """
     if opinion_id is None:
-    return "No opinion ID available for this result."
+        return "No opinion ID available for this result."
     url = f"{BASE_URL}/opinions/{opinion_id}/"
     r = requests.get(url, headers=make_headers(token))
     r.raise_for_status()
