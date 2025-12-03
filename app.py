@@ -377,9 +377,13 @@ def main():
             st.stop()
 
         if not base_results:
+            st.write(f"API returned {len(base_results)} raw results before slicing.")
             st.info("No matching cases found.")
             st.stop()
 
+        #force the slider
+        base_results = base_results[:num_results]
+        
         # 2) Show extracted keywords
         user_keywords = extract_keywords(user_desc, top_n=12)
         st.markdown("### Extracted Keywords from Your Description")
