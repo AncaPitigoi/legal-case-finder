@@ -377,13 +377,12 @@ def main():
             st.stop()
 
         if not base_results:
-            st.write(f"API returned {len(base_results)} raw results before slicing.")
             st.info("No matching cases found.")
             st.stop()
 
-        #force the slider
+        # 🔹 Hard cap by slider, in case API returns more
         base_results = base_results[:num_results]
-        
+
         # 2) Show extracted keywords
         user_keywords = extract_keywords(user_desc, top_n=12)
         st.markdown("### Extracted Keywords from Your Description")
@@ -392,15 +391,10 @@ def main():
         else:
             st.write("_No significant keywords detected (input may be too short)._")
 
-        # 3) Build enriched_results with optional GPT scoring
+        # 3) First pass: build enriched_results with ONLY Jaccard
         enriched_results = []
-        max_gpt = 5  # only run GPT judge on top N raw search results
 
-        if use_gpt_scoring and openai_client is None:
-            st.warning("GPT scoring enabled, but OPENAI_API_KEY is not configured in secrets.")
-            use_gpt_scoring = False
-
-        for idx, result in enumerate(base_results):
+        for result in base_results:
             opinion_id = result["id"]
 
             try:
@@ -414,38 +408,51 @@ def main():
             case_tokens = tokenize(text)
             cheap_score = jaccard_score(user_keywords, case_tokens) if use_rerank else None
 
-            # GPT similarity (optional, top max_gpt only)
-            gpt_score = None
-            gpt_reason = ""
-            if use_gpt_scoring and idx < max_gpt:
-                gpt_score, gpt_reason = gpt_similarity_score(
-                    user_description=user_desc,
-                    opinion_text=text,
-                    client=openai_client,
-                    model=gpt_model,
-                )
-
             enriched = {**result}
             enriched["text"] = text
             enriched["summary"] = summary
             enriched["similarity"] = cheap_score      # Jaccard
-            enriched["gpt_score"] = gpt_score         # 0–5 score
-            enriched["gpt_reason"] = gpt_reason       # explanation
+            enriched["gpt_score"] = None              # placeholder
+            enriched["gpt_reason"] = ""               # placeholder
             enriched_results.append(enriched)
 
-        # 4) Sorting: GPT first (if used), otherwise Jaccard
-        if use_gpt_scoring:
-            enriched_results.sort(
-                key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
-                reverse=True,
-            )
-        elif use_rerank:
+        # 4) Sort ALL results by Jaccard first (baseline ranking)
+        if use_rerank:
             enriched_results.sort(
                 key=lambda x: (x["similarity"] if x["similarity"] is not None else 0.0),
                 reverse=True,
             )
 
-        # 5) Display results
+        # 5) GPT only reranks the TOP N according to Jaccard
+        max_gpt = 5  # number of top-Jaccard cases to refine with GPT
+
+        if use_gpt_scoring:
+            if openai_client is None:
+                st.warning("GPT scoring enabled, but OPENAI_API_KEY is not configured in secrets.")
+            else:
+                top_for_gpt = enriched_results[:max_gpt]
+                rest = enriched_results[max_gpt:]
+
+                # call GPT on these top cases
+                for case in top_for_gpt:
+                    gpt_score, gpt_reason = gpt_similarity_score(
+                        user_description=user_desc,
+                        opinion_text=case["text"],
+                        client=openai_client,
+                        model=gpt_model,
+                    )
+                    case["gpt_score"] = gpt_score
+                    case["gpt_reason"] = gpt_reason
+
+                # sort ONLY the top segment by GPT score, keep rest in Jaccard order
+                top_for_gpt.sort(
+                    key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
+                    reverse=True,
+                )
+
+                enriched_results = top_for_gpt + rest
+
+        # 6) Display results
         st.markdown("## Results")
 
         for i, case in enumerate(enriched_results, start=1):
