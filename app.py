@@ -5,10 +5,12 @@ from collections import Counter
 import requests
 import streamlit as st
 
-# -----------------------------
+import json
+from openai import OpenAI
+
+
 # API & CONFIG
 # -----------------------------
-
 BASE_URL = "https://www.courtlistener.com/api/rest/v4"
 
 # Minimal English stopword list for simple NLP
@@ -20,6 +22,16 @@ STOPWORDS = {
     "but", "if", "so", "not", "no", "can", "could", "would", "should",
     "about", "into", "over", "under", "between", "because", "up", "down"
 }
+
+# using openai for text processing
+def get_openai_client():
+    api_key = st.secrets.get("OPENAI_API_KEY")  # or os.getenv() for backup
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+openai_client = get_openai_client()
 
 
 def get_api_token():
@@ -49,10 +61,8 @@ def make_headers(token: str):
     }
 
 
-# -----------------------------
 # SIMPLE NLP UTILITIES
 # -----------------------------
-
 def tokenize(text: str):
     """Lowercase, remove non-letters, split into tokens."""
     text = text.lower()
@@ -66,7 +76,6 @@ def extract_keywords(text: str, top_n: int = 10):
     tokens = [t for t in tokens if t not in STOPWORDS]
     if not tokens:
         return []
-
     counts = Counter(tokens)
     return [w for w, _ in counts.most_common(top_n)]
 
@@ -99,10 +108,68 @@ def strip_xml_tags(xml: str) -> str:
     return no_tags.strip()
 
 
-# -----------------------------
+def gpt_similarity_score(
+    user_description: str,
+    opinion_text: str,
+    client: OpenAI,
+    model: str = "gpt-4o-mini",
+):
+    """
+    Ask GPT to score how similar an opinion is to the user's case (0–5)
+    and give a short natural-language reason.
+
+    Returns (score: float, reason: str)
+    """
+    if client is None:
+        return None, "GPT client not configured."
+
+    # keep prompt size reasonable
+    snippet = opinion_text[:2000]
+
+    system_prompt = (
+        "You are a legal research assistant. "
+        "Given a user's case description and a court opinion, you rate how relevant "
+        "the opinion is to the user's case on a 0 to 5 scale and explain why. "
+        "0 = completely unrelated. 5 = very similar facts and legal issues. "
+        "Respond ONLY in valid JSON with keys 'score' (number) and 'reason' (string)."
+    )
+
+    user_prompt = f"""
+User's case description:
+\"\"\"{user_description}\"\"\"
+
+Court opinion excerpt:
+\"\"\"{snippet}\"\"\"
+
+Please output JSON like:
+{{
+  "score": 0-5 number,
+  "reason": "short explanation"
+}}
+"""
+
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = resp.output[0].content[0].text  # text containing our JSON
+    try:
+        data = json.loads(content)
+        score = float(data.get("score", 0))
+        reason = data.get("reason", "")
+        return score, reason
+    except Exception:
+        # Fallback if parsing fails
+        return None, f"Could not parse GPT response: {content[:200]}"
+
+
 # COURTLISTENER HELPERS (v4)
 # -----------------------------
-
 def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str | None = None):
     params = {
         "q": query,
@@ -143,7 +210,7 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
             if isinstance(docket, dict):
                 case_name = docket.get("case_name") or docket.get("caseName")
 
-        # If still missing, derive from URL slug: /opinion/5302688/schindler-elevator-corporation-v-darren-ceasar/
+        # If still missing, derive from URL slug
         if not case_name and abs_url:
             m = re.search(r"/opinion/\d+/(.*?)/?$", abs_url)
             if m:
@@ -215,7 +282,6 @@ def get_opinion_text(token: str, opinion_id: int):
 
     html = data.get("html")
     if html:
-        # You could keep HTML, but for now just return it verbatim.
         return html
 
     xml = data.get("xml_harvard")
@@ -225,10 +291,8 @@ def get_opinion_text(token: str, opinion_id: int):
     return "No opinion text available."
 
 
-# -----------------------------
 # STREAMLIT APP
 # -----------------------------
-
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
 
@@ -236,7 +300,7 @@ def main():
     st.write(
         "Describe a legal scenario, and this app retrieves **similar cases** using the "
         "CourtListener API v4 and light NLP for keyword extraction, similarity scoring, "
-        "and naive summaries."
+        "and naive summaries (with optional GPT scoring)."
     )
 
     st.sidebar.header("Settings")
@@ -259,6 +323,18 @@ def main():
         "Federal (us)": "us",
     }
     jurisdiction = jurisdiction_map[jurisdiction_label]
+
+    gpt_model = st.sidebar.selectbox(
+        "GPT model",
+        ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
+        index=0,
+        help="Use gpt-4o-mini for lowest cost."
+    )
+    use_gpt_scoring = st.sidebar.checkbox(
+        "Use GPT similarity judge (top 5 only)",
+        value=False,
+        help="LLM-based similarity & explanation. Slower and uses OpenAI credits."
+    )
 
     num_results = st.sidebar.slider(
         "Number of results",
@@ -287,6 +363,7 @@ def main():
             st.warning("Please enter a description first.")
             st.stop()
 
+        # 1) Call CourtListener
         try:
             with st.spinner("Searching CourtListener (v4)..."):
                 base_results = search_cases(
@@ -303,7 +380,7 @@ def main():
             st.info("No matching cases found.")
             st.stop()
 
-        # NLP: extract keywords from user description
+        # 2) Show extracted keywords
         user_keywords = extract_keywords(user_desc, top_n=12)
         st.markdown("### Extracted Keywords from Your Description")
         if user_keywords:
@@ -311,15 +388,17 @@ def main():
         else:
             st.write("_No significant keywords detected (input may be too short)._")
 
+        # 3) Build enriched_results with optional GPT scoring
         enriched_results = []
-        if use_rerank:
-            st.info(
-                "Re-ranking results using keyword overlap. "
-                "This may take a few extra seconds."
-            )
+        max_gpt = 5  # only run GPT judge on top N raw search results
 
-        for result in base_results:
+        if use_gpt_scoring and openai_client is None:
+            st.warning("GPT scoring enabled, but OPENAI_API_KEY is not configured in secrets.")
+            use_gpt_scoring = False
+
+        for idx, result in enumerate(base_results):
             opinion_id = result["id"]
+
             try:
                 text = get_opinion_text(token, opinion_id)
             except Exception as e:
@@ -327,30 +406,50 @@ def main():
 
             summary = summarize_text(text, max_sentences=3)
 
-            if use_rerank:
-                case_tokens = tokenize(text)
-                score = jaccard_score(user_keywords, case_tokens)
-            else:
-                score = None
+            # Cheap keyword-based similarity (Jaccard)
+            case_tokens = tokenize(text)
+            cheap_score = jaccard_score(user_keywords, case_tokens) if use_rerank else None
+
+            # GPT similarity (optional, top max_gpt only)
+            gpt_score = None
+            gpt_reason = ""
+            if use_gpt_scoring and idx < max_gpt:
+                gpt_score, gpt_reason = gpt_similarity_score(
+                    user_description=user_desc,
+                    opinion_text=text,
+                    client=openai_client,
+                    model=gpt_model,
+                )
 
             enriched = {**result}
             enriched["text"] = text
             enriched["summary"] = summary
-            enriched["similarity"] = score
+            enriched["similarity"] = cheap_score      # Jaccard
+            enriched["gpt_score"] = gpt_score         # 0–5 score
+            enriched["gpt_reason"] = gpt_reason       # explanation
             enriched_results.append(enriched)
 
-        # Optional: sort by similarity
-        if use_rerank:
+        # 4) Sorting: GPT first (if used), otherwise Jaccard
+        if use_gpt_scoring:
+            enriched_results.sort(
+                key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
+                reverse=True,
+            )
+        elif use_rerank:
             enriched_results.sort(
                 key=lambda x: (x["similarity"] if x["similarity"] is not None else 0.0),
                 reverse=True,
             )
 
+        # 5) Display results
         st.markdown("## Results")
 
         for i, case in enumerate(enriched_results, start=1):
             similarity = case.get("similarity")
             sim_str = f"{similarity:.3f}" if similarity is not None else "N/A"
+
+            gpt_score = case.get("gpt_score")
+            gpt_reason = case.get("gpt_reason") or ""
 
             with st.expander(f"{i}. {case['case_name']}"):
                 cols = st.columns([3, 2])
@@ -358,11 +457,17 @@ def main():
                     st.markdown(f"**Citation:** {case['citation']}")
                     st.markdown(f"**Court:** {case['court']}")
                     st.markdown(f"**Date:** {case['date']}")
-                    st.markdown(f"**Relevance score (NLP):** {sim_str}")
+                    st.markdown(f"**Relevance score (Jaccard):** {sim_str}")
+                    if gpt_score is not None:
+                        st.markdown(f"**Relevance score (GPT, 0–5):** {gpt_score:.2f}")
                 with cols[1]:
                     st.markdown(
                         f"[Open full case on CourtListener]({case['web_url']})"
                     )
+
+                if gpt_reason:
+                    st.markdown("**GPT explanation of relevance:**")
+                    st.write(gpt_reason)
 
                 st.markdown("**Summary (naive, first few sentences):**")
                 st.write(textwrap.fill(case["summary"], width=90))
