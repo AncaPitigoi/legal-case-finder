@@ -121,7 +121,7 @@ def gpt_similarity_score(
     Returns (score: float or None, reason: str).
     """
     if client is None:
-        return None, "GPT client not configured."
+        return None, "GPT client is not configured."
 
     # keep prompt size reasonable
     snippet = opinion_text[:2000]
@@ -147,8 +147,7 @@ Please output JSON like:
   "reason": "short explanation"
 }}
 """
-
-    # ⚠️ No response_format here, to match the older SDK
+try: 
     resp = client.responses.create(
         model=model,
         input=[
@@ -157,28 +156,25 @@ Please output JSON like:
         ],
     )
 
-    # Try to get the text in a way that works across SDK versions
+    # Extract text
     try:
-        # new-style responses API
         content = resp.output[0].content[0].text
-    except Exception:
-        try:
-            # some SDKs expose this convenience property
-            content = resp.output_text
         except Exception:
-            # last-resort: just stringify the response
-            content = str(resp)
+            content = getattr(resp, "output_text", str(resp))
 
-    # Now parse the JSON the model returned
-    try:
         data = json.loads(content)
-        score = float(data.get("score", 0))
-        reason = data.get("reason", "")
-        return score, reason
-    except Exception:
-        # Fallback if parsing fails
-        return None, f"Could not parse GPT response: {content[:200]}"
+        return float(data.get("score", 0)), data.get("reason", "")
 
+except Exception as e:
+        msg = str(e)
+
+        if "insufficient_quota" in msg:
+            return None, "GPT is unavailable (insufficient OpenAI quota). Using classical NLP only."
+
+        if "429" in msg:
+            return None, "GPT temporarily rate-limited. Using classical NLP only."
+
+        return None, f"GPT error: {msg[:120]}"
 
 # COURTLISTENER HELPERS (v4)
 # -----------------------------
@@ -336,16 +332,12 @@ def main():
     }
     jurisdiction = jurisdiction_map[jurisdiction_label]
 
-    gpt_model = st.sidebar.selectbox(
-        "GPT model",
-        ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
-        index=0,
-        help="Use gpt-4o-mini for lowest cost."
-    )
+    gpt_model = "gpt-4o-mini"   # cheapest model
+
     use_gpt_scoring = st.sidebar.checkbox(
         "Use GPT similarity judge (top 5 only)",
         value=False,
-        help="LLM-based similarity & explanation. Slower and uses OpenAI credits."
+        help="Adds semantic relevance scoring when GPT quota is available."
     )
 
     num_results = st.sidebar.slider(
