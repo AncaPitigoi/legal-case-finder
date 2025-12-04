@@ -114,16 +114,9 @@ def gpt_similarity_score(
     client: OpenAI,
     model: str = "gpt-4o-mini",
 ):
-    """
-    Ask GPT to score how similar an opinion is to the user's case (0–5)
-    and give a short natural-language reason.
-
-    Returns (score: float or None, reason: str).
-    """
     if client is None:
-        return None, "GPT client is not configured."
+        return None, "GPT is not configured."
 
-    # keep prompt size reasonable
     snippet = opinion_text[:2000]
 
     system_prompt = (
@@ -135,37 +128,38 @@ def gpt_similarity_score(
     )
 
     user_prompt = f"""
-User's case description:
+User's case:
 \"\"\"{user_description}\"\"\"
 
-Court opinion excerpt:
+Opinion excerpt:
 \"\"\"{snippet}\"\"\"
 
-Please output JSON like:
+JSON response example:
 {{
-  "score": 0-5 number,
-  "reason": "short explanation"
+  "score": 3,
+  "reason": "short explanation here"
 }}
 """
-try: 
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
 
-    # Extract text
     try:
-        content = resp.output[0].content[0].text
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        # Extract the text safely
+        try:
+            content = resp.output[0].content[0].text
         except Exception:
             content = getattr(resp, "output_text", str(resp))
 
         data = json.loads(content)
         return float(data.get("score", 0)), data.get("reason", "")
 
-except Exception as e:
+    except Exception as e:
         msg = str(e)
 
         if "insufficient_quota" in msg:
@@ -175,6 +169,7 @@ except Exception as e:
             return None, "GPT temporarily rate-limited. Using classical NLP only."
 
         return None, f"GPT error: {msg[:120]}"
+
 
 # COURTLISTENER HELPERS (v4)
 # -----------------------------
