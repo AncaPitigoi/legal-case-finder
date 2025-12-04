@@ -7,6 +7,7 @@ import streamlit as st
 
 import json
 from openai import OpenAI
+import time
 
 
 # API & CONFIG
@@ -150,14 +151,17 @@ JSON response example:
             ],
         )
 
-        # Extract the text safely
+        # Extract text safely across SDK versions
         try:
             content = resp.output[0].content[0].text
         except Exception:
             content = getattr(resp, "output_text", str(resp))
 
         data = json.loads(content)
-        return float(data.get("score", 0)), data.get("reason", "")
+        score = float(data.get("score", 0))
+        reason = data.get("reason", "")
+
+        return score, reason
 
     except Exception as e:
         msg = str(e)
