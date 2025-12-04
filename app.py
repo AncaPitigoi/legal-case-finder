@@ -26,32 +26,55 @@ STOPWORDS = {
 
 # using openai for text processing
 def get_openai_client():
-    api_key = st.secrets.get("OPENAI_API_KEY")  # or os.getenv() for backup
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+    """
+    Retrieve an OpenAI client using:
+    1. OPENAI_API_KEY from Streamlit secrets, if available.
+    2. Otherwise, a user-provided API key via the sidebar.
+    """
 
+    # 1. Try Streamlit secrets
+    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    if api_key:
+        return OpenAI(api_key=api_key.strip())
+
+    # 2. Let the user enter their own key
+    user_key = st.sidebar.text_input(
+        "OpenAI API Key",
+        type="password",
+        help="Enter your OpenAI API key if the app's key is unavailable."
+    )
+
+    if user_key:
+        return OpenAI(api_key=user_key.strip())
+
+    # No API key available
+    return None
 
 openai_client = get_openai_client()
 
-
 def get_api_token():
     """
-    Get API token from Streamlit secrets or sidebar input.
-    If COURTLISTENER_API_TOKEN exists in st.secrets, use that.
-    Otherwise, show a password field in the sidebar.
+    Retrieve a CourtListener API token.
+    
+    Priority:
+    1. If COURTLISTENER_API_TOKEN exists in st.secrets, use that.
+    2. Otherwise, allow the user to manually enter a token via the sidebar.
     """
+
+    # 1. Try Streamlit secrets
     token = st.secrets.get("COURTLISTENER_API_TOKEN", None)
     if token:
-        # Debug helper – shows only first few chars so you know it's loaded.
-        st.sidebar.write(f"Loaded token starting with: {token[:4]}***")
-        return token
+        # Optional: uncomment if you want a confirmation that a secret was loaded
+        # st.sidebar.caption(f"Using stored API token.")
+        return token.strip()
 
+    # 2. Ask user for a token if no stored secret
     token = st.sidebar.text_input(
         "CourtListener API Token",
         type="password",
-        help="Paste your CourtListener API token here if not using st.secrets."
+        help="Enter your CourtListener API token if the app's token is unavailable."
     )
+
     return token.strip() if token else None
 
 
@@ -92,7 +115,7 @@ def jaccard_score(a_tokens, b_tokens):
     return len(inter) / len(union)
 
 
-def summarize_text(text: str, max_sentences: int = 3):
+def summarize_text(text: str, max_sentences: int = 7, max_chars: int = 1700):
     """Very simple extractive summary: first few sentences."""
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     summary = " ".join(sentences[:max_sentences])
@@ -192,7 +215,6 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
 
     results = []
     for item in data.get("results", []):
-        # --- ID handling (as we fixed before) ---
         opinion_id = item.get("id")
         abs_url = item.get("absolute_url") or ""
         if opinion_id is None and abs_url:
@@ -203,7 +225,7 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
             # Skip if we really cannot determine the ID
             continue
 
-        # --- CASE NAME HANDLING ---
+        # CASE NAME HANDLING 
         case_name = item.get("case_name") or item.get("caseName")
 
         # If still missing, try cluster/docket objects
@@ -230,7 +252,7 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
         if not case_name:
             case_name = "Unknown case name"
 
-        # --- Citation ---
+        # --- Citation 
         cites = item.get("citation") or item.get("citations")
         if isinstance(cites, list):
             citation = cites[0] if cites else "No citation"
@@ -311,48 +333,74 @@ def build_search_query_from_description(desc: str, max_terms: int = 6) -> str:
     return " AND ".join(kws)
 
 
-
-
 # STREAMLIT APP
 # -----------------------------
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
 
-    st.title("🔎 Legal Case Finder (CourtListener)")
+    st.title("🔎📚 Legal Case Finder")
     st.write(
-        "Describe a legal scenario, and this app retrieves **similar cases** using the "
-        "CourtListener API v4 and light NLP for keyword extraction, similarity scoring, "
-        "and naive summaries (with optional GPT scoring)."
+        "Enter a legal scenario and the app retrieves similar cases using the CourtListener API."
     )
 
     st.sidebar.header("Settings")
 
+    # Courtlistener and ChatGPT API
     token = get_api_token()
     if not token:
         st.sidebar.warning("Enter your CourtListener API token to begin.")
         st.stop()
 
-    jurisdiction_label = st.sidebar.selectbox(
-        "Jurisdiction filter",
-        options=["All", "New York (ny)", "California (ca)", "Federal (us)"],
+    import re
+    import streamlit as st
+
+    st.sidebar.subheader("Jurisdiction filter")
+
+    preset_jurisdiction = st.sidebar.selectbox(
+        "Choose or type a jurisdiction",
+        options=["All", "New York (ny)", "California (ca)", "Federal (us)", "Custom..."],
         index=0,
-        help="Optional: Restrict to a jurisdiction. Leave as 'All' to search broadly."
+        help=(
+            "Pick a common jurisdiction or choose 'Custom...' to enter any "
+            "CourtListener jurisdiction code (e.g., 'ny', 'ca', 'mass', 'us')."
+        ),
     )
+
     jurisdiction_map = {
         "All": "all",
         "New York (ny)": "ny",
         "California (ca)": "ca",
         "Federal (us)": "us",
     }
-    jurisdiction = jurisdiction_map[jurisdiction_label]
 
-    gpt_model = "gpt-4o-mini"   # cheapest model
+    if preset_jurisdiction == "Custom...":
+        custom_code = st.sidebar.text_input(
+            "Custom jurisdiction code",
+            value="",
+            placeholder="e.g., ny, ca, mass, us",
+            help="Type a valid CourtListener jurisdiction code. Leave blank for all.",
+        )
 
-    use_gpt_scoring = st.sidebar.checkbox(
-        "Use GPT similarity judge (top 5 only)",
-        value=False,
-        help="Adds semantic relevance scoring when GPT quota is available."
-    )
+        custom_code = custom_code.strip().lower()
+
+        if not custom_code:
+            # No input -> fall back to all
+            st.sidebar.caption("No custom code entered → searching all jurisdictions.")
+            jurisdiction = "all"
+        else:
+            # Simple sanity check: letters / numbers / underscore / hyphen only
+            if re.fullmatch(r"[a-z0-9_\-]+", custom_code):
+                jurisdiction = custom_code
+                st.sidebar.caption(f"Using custom jurisdiction code: '{jurisdiction}'")
+            else:
+                st.sidebar.warning(
+                    "Jurisdiction codes should only contain letters, numbers, "
+                    "hyphen, or underscore. Falling back to all jurisdictions."
+                )
+                jurisdiction = "all"
+    else:
+        jurisdiction = jurisdiction_map[preset_jurisdiction]
+
 
     num_results = st.sidebar.slider(
         "Number of results",
@@ -368,6 +416,16 @@ def main():
         help="Rerank API results using keyword overlap between your description and each opinion."
     )
 
+    
+    gpt_model = "gpt-4o-mini"   # cheapest model
+
+    use_gpt_scoring = st.sidebar.checkbox(
+        "Use GPT similarity judge (top 5 only)",
+        value=False,
+        help="Adds semantic relevance scoring when GPT quota is available."
+    )
+
+    
     st.subheader("Describe Your Case")
     user_desc = st.text_area(
         "Facts, issues, and context:",
@@ -401,12 +459,12 @@ def main():
             st.info("No matching cases found.")
             st.stop()
 
-        # 🔹 Hard cap by slider, in case API returns more
+        # Hard cap by slider, in case API returns more
         base_results = base_results[:num_results]
 
         # 2) Show extracted keywords
         user_keywords = extract_keywords(user_desc, top_n=12)
-        st.markdown("### Extracted Keywords from Your Description")
+        st.markdown("### Extracted eywords from your description")
         if user_keywords:
             st.write(", ".join(user_keywords))
         else:
@@ -423,7 +481,7 @@ def main():
             except Exception as e:
                 text = f"Error retrieving opinion text: {e}"
 
-            summary = summarize_text(text, max_sentences=3)
+            summary = summarize_text(text, max_sentences=7)
 
             # Cheap keyword-based similarity (Jaccard)
             case_tokens = tokenize(text)
@@ -451,7 +509,7 @@ def main():
             )
 
         # 5) GPT only reranks the TOP N according to Jaccard
-        max_gpt = 5  # number of top-Jaccard cases to refine with GPT
+        max_gpt = num_results  # number of top-Jaccard cases based on slider
 
         if use_gpt_scoring:
             if openai_client is None:
