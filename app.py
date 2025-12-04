@@ -118,7 +118,7 @@ def gpt_similarity_score(
     Ask GPT to score how similar an opinion is to the user's case (0–5)
     and give a short natural-language reason.
 
-    Returns (score: float, reason: str)
+    Returns (score: float or None, reason: str).
     """
     if client is None:
         return None, "GPT client not configured."
@@ -148,16 +148,28 @@ Please output JSON like:
 }}
 """
 
+    # ⚠️ No response_format here, to match the older SDK
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
     )
 
-    content = resp.output[0].content[0].text  # text containing our JSON
+    # Try to get the text in a way that works across SDK versions
+    try:
+        # new-style responses API
+        content = resp.output[0].content[0].text
+    except Exception:
+        try:
+            # some SDKs expose this convenience property
+            content = resp.output_text
+        except Exception:
+            # last-resort: just stringify the response
+            content = str(resp)
+
+    # Now parse the JSON the model returned
     try:
         data = json.loads(content)
         score = float(data.get("score", 0))
