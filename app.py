@@ -453,6 +453,7 @@ def main():
                         client=openai_client,
                         model=gpt_model,
                     )
+                    time.sleep(0.7) #prevents rate limit
                     case["gpt_score"] = gpt_score
                     case["gpt_reason"] = gpt_reason
 
