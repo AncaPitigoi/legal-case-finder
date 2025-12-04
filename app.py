@@ -297,6 +297,21 @@ def get_opinion_text(token: str, opinion_id: int):
 
     return "No opinion text available."
 
+# filter cases only if they match all keywords
+def build_search_query_from_description(desc: str, max_terms: int = 6) -> str:
+    """
+    Build a CourtListener search query from the user's description
+    by extracting keywords and joining them with AND.
+    If extraction fails, fall back to the raw description.
+    """
+    kws = extract_keywords(desc, top_n=max_terms)
+    if not kws:
+        return desc.strip()
+    # e.g. "mold AND apartment AND landlord"
+    return " AND ".join(kws)
+
+
+
 
 # STREAMLIT APP
 # -----------------------------
@@ -368,10 +383,13 @@ def main():
 
         # 1) Call CourtListener
         try:
+            api_query = build_search_query_from_description(user_desc, max_terms=6)
+            st.caption(f"Search query sent to CourtListener: `{api_query}`")
+            
             with st.spinner("Searching CourtListener (v4)..."):
                 base_results = search_cases(
                     token=token,
-                    query=user_desc,
+                    query=api_query,
                     page_size=num_results,
                     jurisdiction=jurisdiction,
                 )
@@ -409,6 +427,12 @@ def main():
 
             # Cheap keyword-based similarity (Jaccard)
             case_tokens = tokenize(text)
+            
+            # Require at least one of the user keywords to appear in the opinion text
+            if user_keywords:
+                if not set(user_keywords) & set(case_tokens):
+                    continue
+                    
             cheap_score = jaccard_score(user_keywords, case_tokens) if use_rerank else None
 
             enriched = {**result}
