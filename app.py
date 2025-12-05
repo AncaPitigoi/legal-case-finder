@@ -131,6 +131,15 @@ def strip_xml_tags(xml: str) -> str:
     no_tags = re.sub(r"\s+", " ", no_tags)
     return no_tags.strip()
 
+def strip_html_tags(text: str) -> str:
+    """Very small helper to remove basic HTML tags from snippets."""
+    if not text:
+        return ""
+    # Remove tags like <b>...</b>, <em>, etc.
+    text = re.sub(r"<[^>]+>", "", text)
+    # Collapse multiple spaces
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 def gpt_similarity_score(
     user_description: str,
@@ -200,98 +209,200 @@ JSON response example:
 
 # COURTLISTENER HELPERS (v4)
 # -----------------------------
-def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str | None = None):
+def search_case_metadata(
+    token: str,
+    query: str,
+    jurisdiction: str = "all",
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Metadata-only search using CourtListener /search/ endpoint.
+    Returns a list of dicts with id, case_name, citation, court, date, web_url, snippet.
+    Over-fetches across pages up to max_results.
+    """
+    base_url = f"{BASE_URL}/search/"
+    headers = make_headers(token)
+
     params = {
         "q": query,
-        "type": "o",          # opinions
-        "page_size": page_size,
+        "type": "o",         # opinions
+        "page_size": 20,     # page size per request; we loop pages
     }
     if jurisdiction != "all":
         params["jurisdiction"] = jurisdiction
 
-    r = requests.get(f"{BASE_URL}/search/", headers=make_headers(token), params=params)
-    r.raise_for_status()
-    data = r.json()
+    results: list[dict] = []
+    next_url: str | None = base_url
 
-    results = []
-    for item in data.get("results", []):
-        opinion_id = item.get("id")
-        abs_url = item.get("absolute_url") or ""
-        if opinion_id is None and abs_url:
-            m = re.search(r"/opinion/(\d+)/", abs_url)
-            if m:
-                opinion_id = int(m.group(1))
-        if opinion_id is None:
-            # Skip if we really cannot determine the ID
-            continue
+    while next_url and len(results) < max_results:
+        r = requests.get(next_url, headers=headers, params=params)
+        r.raise_for_status()
+        data = r.json()
 
-        # CASE NAME HANDLING 
-        case_name = item.get("case_name") or item.get("caseName")
+        for item in data.get("results", []):
+            opinion_id = item.get("id")
+            abs_url = item.get("absolute_url") or ""
+            if opinion_id is None and abs_url:
+                m = re.search(r"/opinion/(\d+)/", abs_url)
+                if m:
+                    opinion_id = int(m.group(1))
+            if opinion_id is None:
+                # Skip if we really cannot determine the ID
+                continue
 
-        # If still missing, try cluster/docket objects
-        if not case_name:
-            cluster = item.get("cluster") or {}
-            if isinstance(cluster, dict):
-                case_name = cluster.get("case_name") or cluster.get("caseName")
+            # --- Case name ---
+            case_name = item.get("case_name") or item.get("caseName")
 
-        if not case_name:
-            docket = item.get("docket") or {}
-            if isinstance(docket, dict):
-                case_name = docket.get("case_name") or docket.get("caseName")
+            if not case_name:
+                cluster = item.get("cluster") or {}
+                if isinstance(cluster, dict):
+                    case_name = cluster.get("case_name") or cluster.get("caseName")
 
-        # If still missing, derive from URL slug
-        if not case_name and abs_url:
-            m = re.search(r"/opinion/\d+/(.*?)/?$", abs_url)
-            if m:
-                slug = m.group(1)
-                # Make it nicer: replace dashes with spaces, title-case it
-                case_name = slug.replace("-", " ").title()
-                # Optional: fix " V " to " v. "
-                case_name = case_name.replace(" V ", " v. ")
+            if not case_name:
+                docket = item.get("docket") or {}
+                if isinstance(docket, dict):
+                    case_name = docket.get("case_name") or docket.get("caseName")
 
-        if not case_name:
-            case_name = "Unknown case name"
+            if not case_name and abs_url:
+                m = re.search(r"/opinion/\d+/(.*?)/?$", abs_url)
+                if m:
+                    slug = m.group(1)
+                    case_name = slug.replace("-", " ").title()
+                    case_name = case_name.replace(" V ", " v. ")
 
-        # --- Citation 
-        cites = item.get("citation") or item.get("citations")
-        if isinstance(cites, list):
-            citation = cites[0] if cites else "No citation"
-        else:
-            citation = cites or "No citation"
+            if not case_name:
+                case_name = "Unknown case name"
 
-        # --- Court ---
-        court_field = item.get("court")
-        if isinstance(court_field, dict):
-            court_name = court_field.get("name") or court_field.get("court_name")
-        else:
-            court_name = court_field
-        court_name = court_name or item.get("court_name") or "Unknown court"
-
-        # --- Date ---
-        date = item.get("date_filed") or item.get("dateFiled") or item.get("date") or "Unknown date"
-
-        # --- Web URL for user ---
-        if abs_url:
-            if abs_url.startswith("http"):
-                web_url = abs_url
+            # --- Citation ---
+            cites = item.get("citation") or item.get("citations")
+            if isinstance(cites, list):
+                citation = cites[0] if cites else "No citation"
             else:
-                web_url = "https://www.courtlistener.com" + abs_url
-        else:
-            web_url = f"https://www.courtlistener.com/opinion/{opinion_id}/"
+                citation = cites or "No citation"
 
-        results.append(
-            {
-                "id": opinion_id,
-                "case_name": case_name,
-                "citation": citation,
-                "court": court_name,
-                "date": date,
-                "web_url": web_url,
-            }
-        )
+            # --- Court ---
+            court_field = item.get("court")
+            if isinstance(court_field, dict):
+                court_name = court_field.get("name") or court_field.get("court_name")
+            else:
+                court_name = court_field
+            court_name = court_name or item.get("court_name") or "Unknown court"
+
+            # --- Date ---
+            date = (
+                item.get("date_filed")
+                or item.get("dateFiled")
+                or item.get("date")
+                or "Unknown date"
+            )
+
+            # --- Web URL ---
+            if abs_url:
+                if abs_url.startswith("http"):
+                    web_url = abs_url
+                else:
+                    web_url = "https://www.courtlistener.com" + abs_url
+            else:
+                web_url = f"https://www.courtlistener.com/opinion/{opinion_id}/"
+
+            # --- Snippet (metadata-level text, not full opinion) ---
+            snippet = item.get("snippet", "")
+
+            results.append(
+                {
+                    "id": opinion_id,
+                    "case_name": case_name,
+                    "citation": citation,
+                    "court": court_name,
+                    "date": date,
+                    "web_url": web_url,
+                    "snippet": snippet,
+                }
+            )
+
+            if len(results) >= max_results:
+                break
+
+        # Pagination: CourtListener puts absolute next URL in "next"
+        next_url = data.get("next")
+        params = None  # subsequent requests follow next_url directly
 
     return results
 
+def quick_metadata_filter(metadata_list, user_description):
+    """
+    Very cheap, robust filtering on metadata fields only.
+    Returns a subset of metadata_list, or the full list if filtering is too strict.
+    """
+
+    if not metadata_list:
+        return []
+
+    # Extract quick keywords (light NLP)
+    user_keywords = extract_keywords(user_description, top_n=10)
+    user_keywords = [kw.lower() for kw in user_keywords]
+
+    if not user_keywords:
+        return metadata_list  # nothing to filter
+
+    filtered = []
+
+    for item in metadata_list:
+        # Safe access
+        case_name = (item.get("case_name") or "").lower()
+        citation = (item.get("citation") or "").lower()
+        court = (item.get("court") or "").lower()
+        snippet = (item.get("snippet") or "").lower()
+
+        # Very simple heuristics:
+        # keep if ANY keyword appears in case_name, court, or snippet
+        text_blob = " ".join([case_name, citation, court, snippet])
+
+        if any(kw in text_blob for kw in user_keywords):
+            filtered.append(item)
+
+    # If too few after filtering, relax and return original metadata
+    if len(filtered) < 5:
+        return metadata_list
+
+    return filtered
+
+def get_case_snippets(token: str, metadata_cases: list[dict], max_chars: int = 800) -> list[dict]:
+    """
+    Given a list of metadata dicts (from search_case_metadata),
+    attach a short 'snippet_text' to each case.
+
+    Priority:
+    1) Use the 'snippet' field from the search API when available.
+    2) Otherwise, fetch the opinion text and take the first max_chars characters.
+
+    Returns a new list of dicts with all original keys plus 'snippet_text'.
+    """
+    results = []
+
+    for item in metadata_cases:
+        opinion_id = item.get("id")
+        snippet_raw = item.get("snippet") or ""
+
+        # 1) Prefer the snippet returned by the search endpoint
+        if snippet_raw.strip():
+            snippet_text = strip_html_tags(snippet_raw)
+        else:
+            # 2) Fallback: fetch the beginning of the opinion text
+            snippet_text = ""
+            if opinion_id is not None:
+                try:
+                    # If you have a cached version, you can swap this to get_opinion_text_cached
+                    full_text = get_opinion_text(token, opinion_id)
+                    snippet_text = (full_text or "")[:max_chars]
+                except Exception:
+                    snippet_text = ""
+
+        new_item = {**item}
+        new_item["snippet_text"] = snippet_text
+        results.append(new_item)
+
+    return results
 
 def get_opinion_text(token: str, opinion_id: int):
     """
@@ -333,8 +444,6 @@ def build_search_query_from_description(desc: str, max_terms: int = 6) -> str:
     return " AND ".join(kws)
 
 
-# STREAMLIT APP
-# -----------------------------
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
 
@@ -351,6 +460,7 @@ def main():
         st.sidebar.warning("Enter your CourtListener API token to begin.")
         st.stop()
 
+    # ---------------- Jurisdiction UI ----------------
     st.sidebar.subheader("Jurisdiction filter")
 
     preset_jurisdiction = st.sidebar.selectbox(
@@ -381,11 +491,9 @@ def main():
         custom_code = custom_code.strip().lower()
 
         if not custom_code:
-            # No input -> fall back to all
             st.sidebar.caption("No custom code entered → searching all jurisdictions.")
             jurisdiction = "all"
         else:
-            # Simple sanity check: letters / numbers / underscore / hyphen only
             if re.fullmatch(r"[a-z0-9_\-]+", custom_code):
                 jurisdiction = custom_code
                 st.sidebar.caption(f"Using custom jurisdiction code: '{jurisdiction}'")
@@ -398,7 +506,7 @@ def main():
     else:
         jurisdiction = jurisdiction_map[preset_jurisdiction]
 
-
+    # ---------------- Sidebar: other controls ----------------
     num_results = st.sidebar.slider(
         "Number of results",
         min_value=1,
@@ -410,25 +518,26 @@ def main():
     use_rerank = st.sidebar.checkbox(
         "Use NLP re-ranking (keyword overlap)",
         value=True,
-        help="Rerank API results using keyword overlap between your description and each opinion."
+        help="Rerank API results using keyword overlap between your description and each opinion.",
     )
 
-    
-    gpt_model = "gpt-4o-mini"   # cheapest model
+    gpt_model = "gpt-4o-mini"  # cheapest model
 
     use_gpt_scoring = st.sidebar.checkbox(
-        "Use GPT similarity judge (top 5 only)",
+        "Use GPT similarity judge",
         value=False,
-        help="Adds semantic relevance scoring when GPT quota is available."
+        help="Adds semantic relevance scoring when GPT quota is available.",
     )
 
-    
+    # ---------------- Main input ----------------
     st.subheader("Describe Your Case")
     user_desc = st.text_area(
         "Facts, issues, and context:",
         height=150,
-        placeholder="Example: My client slipped on ice outside a supermarket, "
-                    "store knew about the hazard, premises liability, New York..."
+        placeholder=(
+            "Example: My client slipped on ice outside a supermarket, "
+            "store knew about the hazard, premises liability, New York..."
+        ),
     )
 
     if st.button("Search similar cases"):
@@ -436,109 +545,136 @@ def main():
             st.warning("Please enter a description first.")
             st.stop()
 
-        # 1) Call CourtListener
-        try:
-            api_query = build_search_query_from_description(user_desc, max_terms=6)
-            st.caption(f"Search query sent to CourtListener: `{api_query}`")
-            
-            with st.spinner("Searching CourtListener (v4)..."):
-                base_results = search_cases(
-                    token=token,
-                    query=api_query,
-                    page_size=num_results,
-                    jurisdiction=jurisdiction,
-                )
-        except Exception as e:
-            st.error(f"Error while searching CourtListener: {e}")
-            st.stop()
-
-        if not base_results:
-            st.info("No matching cases found.")
-            st.stop()
-
-        # Hard cap by slider, in case API returns more
-        base_results = base_results[:num_results]
-
-        # 2) Show extracted keywords
+        # 1) Extract keywords from user description (for Jaccard + display)
         user_keywords = extract_keywords(user_desc, top_n=12)
-        st.markdown("### Extracted eywords from your description")
+        st.markdown("### Extracted keywords from your description")
         if user_keywords:
             st.write(", ".join(user_keywords))
         else:
             st.write("_No significant keywords detected (input may be too short)._")
 
-        # 3) First pass: build enriched_results with ONLY Jaccard
-        enriched_results = []
+        # 2) Build the CourtListener query string
+        try:
+            api_query = build_search_query_from_description(user_desc, max_terms=6)
+            st.caption(f"Search query sent to CourtListener: `{api_query}`")
+        except Exception as e:
+            st.error(f"Error building search query: {e}")
+            st.stop()
 
-        for result in base_results:
-            opinion_id = result["id"]
+        # 3) METADATA-ONLY SEARCH (over-fetch)
+        try:
+            with st.spinner("Searching CourtListener (metadata only)..."):
+                # You implement search_case_metadata to return a list of dicts with
+                # id, case_name, citation, court, date, web_url, maybe a short snippet.
+                metadata_results = search_case_metadata(
+                    token=token,
+                    query=api_query,
+                    jurisdiction=jurisdiction,
+                    max_results=num_results * 3,  # over-fetch
+                )
+        except Exception as e:
+            st.error(f"Error while searching CourtListener: {e}")
+            st.stop()
 
-            try:
-                text = get_opinion_text(token, opinion_id)
-            except Exception as e:
-                text = f"Error retrieving opinion text: {e}"
+        if not metadata_results:
+            st.info("No matching cases found.")
+            st.stop()
 
-            summary = summarize_text(text, max_sentences=7)
+        # 4) Quick metadata filter (e.g., by title, court, year)
+        #    If filter is too strict and yields nothing, fall back to raw metadata.
+        prelim_filtered = quick_metadata_filter(metadata_results, user_desc)
+        if not prelim_filtered:
+            prelim_filtered = metadata_results
 
-            # Cheap keyword-based similarity (Jaccard)
-            case_tokens = tokenize(text)
-            
-            # Require at least one of the user keywords to appear in the opinion text
-            if user_keywords:
+        # 5) Get snippets (NOT full text) for Jaccard scoring
+        #    Take a slightly reduced set for latency
+        candidates_for_snippets = prelim_filtered[: num_results * 2]
+
+        # You implement get_case_snippets to call CourtListener's "snippet" field,
+        # or a very short text field, but NOT the full opinion.
+        snippets = get_case_snippets(token, candidates_for_snippets)
+
+        if not snippets:
+            st.info("No snippets available for similarity scoring.")
+            st.stop()
+
+        # 6) Apply Jaccard filter on snippets
+        jaccard_ranked = []
+        for case in snippets:
+            snippet_text = case.get("snippet_text", "") or ""
+            if not snippet_text.strip():
+                continue
+
+            if use_rerank and user_keywords:
+                case_tokens = tokenize(snippet_text)
+                # require at least one overlapping keyword
                 if not set(user_keywords) & set(case_tokens):
                     continue
-                    
-            cheap_score = jaccard_score(user_keywords, case_tokens) if use_rerank else None
+                cheap_score = jaccard_score(user_keywords, case_tokens)
+            else:
+                cheap_score = None
 
-            enriched = {**result}
-            enriched["text"] = text
-            enriched["summary"] = summary
-            enriched["similarity"] = cheap_score      # Jaccard
-            enriched["gpt_score"] = None              # placeholder
-            enriched["gpt_reason"] = ""               # placeholder
-            enriched_results.append(enriched)
+            enriched = {**case}
+            enriched["similarity"] = cheap_score
+            enriched["gpt_score"] = None
+            enriched["gpt_reason"] = ""
+            enriched["text"] = ""        # will be filled with full text later
+            enriched["summary"] = ""     # will be filled later
+            jaccard_ranked.append(enriched)
 
-        # 4) Sort ALL results by Jaccard first (baseline ranking)
+        if not jaccard_ranked:
+            st.info("No sufficiently similar cases found after filtering.")
+            st.stop()
+
         if use_rerank:
-            enriched_results.sort(
+            jaccard_ranked.sort(
                 key=lambda x: (x["similarity"] if x["similarity"] is not None else 0.0),
                 reverse=True,
             )
 
-        # 5) GPT only reranks the TOP N according to Jaccard
-        max_gpt = num_results  # number of top-Jaccard cases based on slider
+        # 7) Fetch FULL TEXT ONLY for TOP N after Jaccard
+        top_n = jaccard_ranked[:num_results]
 
+        for case in top_n:
+            try:
+                # You can wrap get_opinion_text with caching if you want:
+                # full_text = get_opinion_text_cached(token, case["id"])
+                full_text = get_opinion_text(token, case["id"])
+            except Exception as e:
+                full_text = f"Error retrieving opinion text: {e}"
+
+            case["text"] = full_text
+            case["summary"] = summarize_text(full_text, max_sentences=7)
+
+        # 8) GPT reranking / scoring (only on top_n)
         if use_gpt_scoring:
             if openai_client is None:
                 st.warning("GPT scoring enabled, but OPENAI_API_KEY is not configured in secrets.")
             else:
-                top_for_gpt = enriched_results[:max_gpt]
-                rest = enriched_results[max_gpt:]
-
-                # call GPT on these top cases
-                for case in top_for_gpt:
+                # Only rerank the set we will actually show
+                for case in top_n:
                     gpt_score, gpt_reason = gpt_similarity_score(
                         user_description=user_desc,
                         opinion_text=case["text"],
                         client=openai_client,
                         model=gpt_model,
                     )
-                    time.sleep(0.7) #prevents rate limit
+                    time.sleep(0.7)  # avoid rate limit
                     case["gpt_score"] = gpt_score
                     case["gpt_reason"] = gpt_reason
 
-                # sort ONLY the top segment by GPT score, keep rest in Jaccard order
-                top_for_gpt.sort(
+                # Sort by GPT score (fallback -1 if missing)
+                top_n.sort(
                     key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
                     reverse=True,
                 )
 
-                enriched_results = top_for_gpt + rest
+        final_results = top_n  # what we display
 
-        # 6) Display results
+        # 9) Display results
         st.markdown("## Results")
 
-        for i, case in enumerate(enriched_results, start=1):
+        for i, case in enumerate(final_results, start=1):
             similarity = case.get("similarity")
             sim_str = f"{similarity:.3f}" if similarity is not None else "N/A"
 
@@ -548,16 +684,17 @@ def main():
             with st.expander(f"{i}. {case['case_name']}"):
                 cols = st.columns([3, 2])
                 with cols[0]:
-                    st.markdown(f"**Citation:** {case['citation']}")
-                    st.markdown(f"**Court:** {case['court']}")
-                    st.markdown(f"**Date:** {case['date']}")
+                    st.markdown(f"**Citation:** {case.get('citation', 'N/A')}")
+                    st.markdown(f"**Court:** {case.get('court', 'N/A')}")
+                    st.markdown(f"**Date:** {case.get('date', 'N/A')}")
                     st.markdown(f"**Relevance score (Jaccard):** {sim_str}")
                     if gpt_score is not None:
                         st.markdown(f"**Relevance score (GPT, 0–5):** {gpt_score:.2f}")
                 with cols[1]:
-                    st.markdown(
-                        f"[Open full case on CourtListener]({case['web_url']})"
-                    )
+                    if case.get("web_url"):
+                        st.markdown(
+                            f"[Open full case on CourtListener]({case['web_url']})"
+                        )
 
                 if gpt_reason:
                     st.markdown("**GPT explanation of relevance:**")
@@ -574,7 +711,6 @@ def main():
                     st.markdown("**Opinion Text (excerpt):**")
                     st.write(textwrap.fill(case["text"][:3000], width=90))
                     st.write("… [truncated] …")
-
 
 if __name__ == "__main__":
     main()
