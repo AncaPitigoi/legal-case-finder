@@ -8,6 +8,14 @@ import streamlit as st
 import json
 from openai import OpenAI
 import time
+import textwrap
+
+
+#for chatbot
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hi! Describe your legal scenario and I’ll find similar cases on CourtListener for you."}
+    ]
 
 
 # API & CONFIG
@@ -443,6 +451,178 @@ def build_search_query_from_description(desc: str, max_terms: int = 6) -> str:
     # e.g. "mold AND apartment AND landlord"
     return " AND ".join(kws)
 
+def run_case_search_chat_reply(
+    user_desc: str,
+    token: str,
+    jurisdiction: str,
+    num_results: int,
+    use_rerank: bool,
+    use_gpt_scoring: bool,
+    gpt_model: str = "gpt-4o-mini",
+) -> str:
+    """
+    Runs the full CourtListener pipeline and returns a chat-style markdown reply
+    summarizing the top cases.
+    """
+
+    user_desc = (user_desc or "").strip()
+    if not user_desc:
+        return "Please describe your legal scenario so I can search for similar cases."
+
+    # 1) Extract keywords from user description (for Jaccard + display)
+    user_keywords = extract_keywords(user_desc, top_n=12)
+
+    # 2) Build the CourtListener query string
+    try:
+        api_query = build_search_query_from_description(user_desc, max_terms=6)
+    except Exception as e:
+        return f"Sorry, I had trouble building a search query from your description (`{e}`). Try rephrasing or simplifying it."
+
+    # 3) METADATA-ONLY SEARCH (over-fetch)
+    try:
+        metadata_results = search_case_metadata(
+            token=token,
+            query=api_query,
+            jurisdiction=jurisdiction,
+            max_results=num_results * 3,  # over-fetch
+        )
+    except Exception as e:
+        return f"Sorry, there was an error while contacting CourtListener: `{e}`."
+
+    if not metadata_results:
+        return "I couldn’t find any matching cases on CourtListener for that description. Try broadening or changing the wording."
+
+    # 4) Quick metadata filter (e.g., by title, court, year)
+    prelim_filtered = quick_metadata_filter(metadata_results, user_desc)
+    if not prelim_filtered:
+        prelim_filtered = metadata_results
+
+    # 5) Get snippets (NOT full text) for Jaccard scoring
+    candidates_for_snippets = prelim_filtered[: num_results * 2]
+    snippets = get_case_snippets(token, candidates_for_snippets)
+
+    if not snippets:
+        return "I found some cases, but none had usable snippets for similarity scoring. You might try a different description."
+
+    # 6) Apply Jaccard filter on snippets
+    jaccard_ranked = []
+    for case in snippets:
+        snippet_text = case.get("snippet_text", "") or ""
+        if not snippet_text.strip():
+            continue
+
+        if use_rerank and user_keywords:
+            case_tokens = tokenize(snippet_text)
+            # Require at least one overlapping keyword
+            if not set(user_keywords) & set(case_tokens):
+                continue
+            cheap_score = jaccard_score(user_keywords, case_tokens)
+        else:
+            cheap_score = None
+
+        enriched = {**case}
+        enriched["similarity"] = cheap_score
+        enriched["gpt_score"] = None
+        enriched["gpt_reason"] = ""
+        enriched["text"] = ""        # will be filled with full text later
+        enriched["summary"] = ""     # will be filled later
+        jaccard_ranked.append(enriched)
+
+    if not jaccard_ranked:
+        return "I found cases, but none looked closely related after filtering. Try giving a bit more detail or using different legal terms."
+
+    if use_rerank:
+        jaccard_ranked.sort(
+            key=lambda x: (x["similarity"] if x["similarity"] is not None else 0.0),
+            reverse=True,
+        )
+
+    # 7) Fetch FULL TEXT ONLY for TOP N after Jaccard
+    top_n = jaccard_ranked[:num_results]
+
+    for case in top_n:
+        try:
+            full_text = get_opinion_text(token, case["id"])
+        except Exception as e:
+            full_text = f"Error retrieving opinion text: {e}"
+
+        case["text"] = full_text
+        case["summary"] = summarize_text(full_text, max_sentences=7)
+
+    # 8) GPT reranking / scoring (only on top_n)
+    if use_gpt_scoring:
+        if openai_client is None:
+            # just annotate in the text instead of using Streamlit warnings
+            note = "\n\n_Note: GPT scoring was requested, but no OpenAI client is configured._"
+            # we still show Jaccard results
+        else:
+            for case in top_n:
+                gpt_score, gpt_reason = gpt_similarity_score(
+                    user_description=user_desc,
+                    opinion_text=case["text"],
+                    client=openai_client,
+                    model=gpt_model,
+                )
+                time.sleep(0.7)  # avoid rate limit
+                case["gpt_score"] = gpt_score
+                case["gpt_reason"] = gpt_reason
+
+            top_n.sort(
+                key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
+                reverse=True,
+            )
+
+    # 9) Build a chat-style markdown reply instead of drawing UI
+    lines: list[str] = []
+
+    # Intro
+    if user_keywords:
+        kw_str = ", ".join(user_keywords)
+        lines.append(
+            "Here are some opinions that appear similar to your scenario, "
+            f"based on keywords like: _{kw_str}_.\n"
+        )
+    else:
+        lines.append(
+            "Here are some opinions that appear similar to your scenario.\n"
+        )
+
+    for i, case in enumerate(top_n, start=1):
+        name = case.get("case_name", "Unknown case")
+        citation = case.get("citation", "No citation")
+        court = case.get("court", "Unknown court")
+        date = case.get("date", "Unknown date")
+        url = case.get("web_url", "")
+        sim = case.get("similarity")
+        sim_str = f"{sim:.3f}" if sim is not None else "N/A"
+        gpt_score = case.get("gpt_score")
+        gpt_reason = case.get("gpt_reason") or ""
+        summary = case.get("summary") or ""
+
+        line = f"**{i}. [{name}]({url})**  \n"
+        line += f"*{citation} – {court}, {date}*  \n"
+        line += f"- Jaccard relevance: `{sim_str}`  \n"
+        if gpt_score is not None:
+            line += f"- GPT relevance (0–5): **{gpt_score:.2f}**  \n"
+
+        if summary:
+            short_summary = textwrap.shorten(summary, width=400, placeholder="…")
+            line += f"- Summary: {short_summary}  \n"
+
+        if gpt_reason:
+            short_reason = textwrap.shorten(gpt_reason, width=300, placeholder="…")
+            line += f"- GPT explanation: {short_reason}  \n"
+
+        lines.append(line)
+
+    lines.append(
+        "\nYou can follow up with questions like:\n"
+        "- “Explain why case 1 is relevant to my facts.”\n"
+        "- “Compare cases 1 and 2.”\n"
+        "- “Find more cases about a slightly different issue.”"
+    )
+
+    return "\n\n".join(lines)
 
 def main():
     st.set_page_config(page_title="Legal Case Finder", layout="wide")
@@ -530,187 +710,33 @@ def main():
     )
 
     # ---------------- Main input ----------------
-    st.subheader("Describe Your Case")
-    user_desc = st.text_area(
-        "Facts, issues, and context:",
-        height=150,
-        placeholder=(
-            "Example: My client slipped on ice outside a supermarket, "
-            "store knew about the hazard, premises liability, New York..."
-        ),
-    )
-
-    if st.button("Search similar cases"):
-        if not user_desc.strip():
-            st.warning("Please enter a description first.")
-            st.stop()
-
-        # 1) Extract keywords from user description (for Jaccard + display)
-        user_keywords = extract_keywords(user_desc, top_n=12)
-        st.markdown("### Extracted keywords from your description")
-        if user_keywords:
-            st.write(", ".join(user_keywords))
-        else:
-            st.write("_No significant keywords detected (input may be too short)._")
-
-        # 2) Build the CourtListener query string
-        try:
-            api_query = build_search_query_from_description(user_desc, max_terms=6)
-            st.caption(f"Search query sent to CourtListener: `{api_query}`")
-        except Exception as e:
-            st.error(f"Error building search query: {e}")
-            st.stop()
-
-        # 3) METADATA-ONLY SEARCH (over-fetch)
-        try:
-            with st.spinner("Searching CourtListener (metadata only)..."):
-                # You implement search_case_metadata to return a list of dicts with
-                # id, case_name, citation, court, date, web_url, maybe a short snippet.
-                metadata_results = search_case_metadata(
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    
+    # 2) Get new user input
+    user_input = st.chat_input("Describe your legal scenario...")
+    
+    if user_input:
+        # add user message to history
+        st.session_state.messages.append({"role": "user", "content": user_input})
+    
+        # run pipeline + show assistant reply
+        with st.chat_message("assistant"):
+            with st.spinner("Searching CourtListener..."):
+                reply = run_case_search_chat_reply(
+                    user_desc=user_input,
                     token=token,
-                    query=api_query,
                     jurisdiction=jurisdiction,
-                    max_results=num_results * 3,  # over-fetch
+                    num_results=num_results,
+                    use_rerank=use_rerank,
+                    use_gpt_scoring=use_gpt_scoring,
+                    gpt_model=gpt_model,  # same as before
                 )
-        except Exception as e:
-            st.error(f"Error while searching CourtListener: {e}")
-            st.stop()
-
-        if not metadata_results:
-            st.info("No matching cases found.")
-            st.stop()
-
-        # 4) Quick metadata filter (e.g., by title, court, year)
-        #    If filter is too strict and yields nothing, fall back to raw metadata.
-        prelim_filtered = quick_metadata_filter(metadata_results, user_desc)
-        if not prelim_filtered:
-            prelim_filtered = metadata_results
-
-        # 5) Get snippets (NOT full text) for Jaccard scoring
-        #    Take a slightly reduced set for latency
-        candidates_for_snippets = prelim_filtered[: num_results * 2]
-
-        # You implement get_case_snippets to call CourtListener's "snippet" field,
-        # or a very short text field, but NOT the full opinion.
-        snippets = get_case_snippets(token, candidates_for_snippets)
-
-        if not snippets:
-            st.info("No snippets available for similarity scoring.")
-            st.stop()
-
-        # 6) Apply Jaccard filter on snippets
-        jaccard_ranked = []
-        for case in snippets:
-            snippet_text = case.get("snippet_text", "") or ""
-            if not snippet_text.strip():
-                continue
-
-            if use_rerank and user_keywords:
-                case_tokens = tokenize(snippet_text)
-                # require at least one overlapping keyword
-                if not set(user_keywords) & set(case_tokens):
-                    continue
-                cheap_score = jaccard_score(user_keywords, case_tokens)
-            else:
-                cheap_score = None
-
-            enriched = {**case}
-            enriched["similarity"] = cheap_score
-            enriched["gpt_score"] = None
-            enriched["gpt_reason"] = ""
-            enriched["text"] = ""        # will be filled with full text later
-            enriched["summary"] = ""     # will be filled later
-            jaccard_ranked.append(enriched)
-
-        if not jaccard_ranked:
-            st.info("No sufficiently similar cases found after filtering.")
-            st.stop()
-
-        if use_rerank:
-            jaccard_ranked.sort(
-                key=lambda x: (x["similarity"] if x["similarity"] is not None else 0.0),
-                reverse=True,
-            )
-
-        # 7) Fetch FULL TEXT ONLY for TOP N after Jaccard
-        top_n = jaccard_ranked[:num_results]
-
-        for case in top_n:
-            try:
-                # You can wrap get_opinion_text with caching if you want:
-                # full_text = get_opinion_text_cached(token, case["id"])
-                full_text = get_opinion_text(token, case["id"])
-            except Exception as e:
-                full_text = f"Error retrieving opinion text: {e}"
-
-            case["text"] = full_text
-            case["summary"] = summarize_text(full_text, max_sentences=7)
-
-        # 8) GPT reranking / scoring (only on top_n)
-        if use_gpt_scoring:
-            if openai_client is None:
-                st.warning("GPT scoring enabled, but OPENAI_API_KEY is not configured in secrets.")
-            else:
-                # Only rerank the set we will actually show
-                for case in top_n:
-                    gpt_score, gpt_reason = gpt_similarity_score(
-                        user_description=user_desc,
-                        opinion_text=case["text"],
-                        client=openai_client,
-                        model=gpt_model,
-                    )
-                    time.sleep(0.7)  # avoid rate limit
-                    case["gpt_score"] = gpt_score
-                    case["gpt_reason"] = gpt_reason
-
-                # Sort by GPT score (fallback -1 if missing)
-                top_n.sort(
-                    key=lambda x: (x["gpt_score"] if x["gpt_score"] is not None else -1),
-                    reverse=True,
-                )
-
-        final_results = top_n  # what we display
-
-        # 9) Display results
-        st.markdown("## Results")
-
-        for i, case in enumerate(final_results, start=1):
-            similarity = case.get("similarity")
-            sim_str = f"{similarity:.3f}" if similarity is not None else "N/A"
-
-            gpt_score = case.get("gpt_score")
-            gpt_reason = case.get("gpt_reason") or ""
-
-            with st.expander(f"{i}. {case['case_name']}"):
-                cols = st.columns([3, 2])
-                with cols[0]:
-                    st.markdown(f"**Citation:** {case.get('citation', 'N/A')}")
-                    st.markdown(f"**Court:** {case.get('court', 'N/A')}")
-                    st.markdown(f"**Date:** {case.get('date', 'N/A')}")
-                    st.markdown(f"**Relevance score (Jaccard):** {sim_str}")
-                    if gpt_score is not None:
-                        st.markdown(f"**Relevance score (GPT, 0–5):** {gpt_score:.2f}")
-                with cols[1]:
-                    if case.get("web_url"):
-                        st.markdown(
-                            f"[Open full case on CourtListener]({case['web_url']})"
-                        )
-
-                if gpt_reason:
-                    st.markdown("**GPT explanation of relevance:**")
-                    st.write(gpt_reason)
-
-                st.markdown("**Summary (naive, first few sentences):**")
-                st.write(textwrap.fill(case["summary"], width=90))
-
-                show_full = st.checkbox(
-                    f"Show opinion excerpt for result {i}",
-                    key=f"show_full_{i}",
-                )
-                if show_full:
-                    st.markdown("**Opinion Text (excerpt):**")
-                    st.write(textwrap.fill(case["text"][:3000], width=90))
-                    st.write("… [truncated] …")
+                st.markdown(reply)
+    
+        # save assistant reply
+        st.session_state.messages.append({"role": "assistant", "content": reply})
 
 if __name__ == "__main__":
     main()
