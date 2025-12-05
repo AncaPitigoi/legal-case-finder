@@ -206,7 +206,7 @@ def search_cases(token: str, query: str, page_size: int = 5, jurisdiction: str |
         "type": "o",          # opinions
         "page_size": page_size,
     }
-    if jurisdiction and jurisdiction != "all":
+    if jurisdiction != "all":
         params["jurisdiction"] = jurisdiction
 
     r = requests.get(f"{BASE_URL}/search/", headers=make_headers(token), params=params)
@@ -350,9 +350,6 @@ def main():
     if not token:
         st.sidebar.warning("Enter your CourtListener API token to begin.")
         st.stop()
-
-    import re
-    import streamlit as st
 
     st.sidebar.subheader("Jurisdiction filter")
 
