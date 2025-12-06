@@ -696,14 +696,6 @@ def main():
                 st.markdown("**First few sentences of opinion:**")
                 st.write(textwrap.fill(case["summary"], width=90))
 
-                show_full = st.checkbox(
-                    f"Show opinion excerpt for result {i}",
-                    key=f"show_full_{i}",
-                )
-                if show_full:
-                    st.markdown("**Opinion Text (excerpt):**")
-                    st.write(textwrap.fill(case["text"][:3000], width=90))
-                    st.write("… [truncated] …")
 
 if __name__ == "__main__":
     main()
