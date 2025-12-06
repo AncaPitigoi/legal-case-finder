@@ -513,11 +513,7 @@ def main():
         step=1,
     )
 
-    use_rerank = st.sidebar.checkbox(
-        "Use NLP re-ranking (keyword overlap)",
-        value=True,
-        help="Rerank API results using keyword overlap between your description and each opinion.",
-    )
+    use_rerank = True #no need to show this
 
     gpt_model = "gpt-4o-mini"  # cheapest model
 
