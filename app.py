@@ -461,8 +461,6 @@ def main():
         st.stop()
 
     # ---------------- Jurisdiction UI ----------------
-    st.sidebar.subheader("Jurisdiction filter")
-
     preset_jurisdiction = st.sidebar.selectbox(
         "Choose or type a jurisdiction",
         options=["All", "New York (ny)", "California (ca)", "Federal (us)", "Custom..."],
@@ -510,7 +508,7 @@ def main():
     num_results = st.sidebar.slider(
         "Number of results",
         min_value=1,
-        max_value=15,
+        max_value=30, #this will look through 30 cases on COURTLISTENER; doesn't mean it will give back 30 cases
         value=5,
         step=1,
     )
@@ -524,7 +522,7 @@ def main():
     gpt_model = "gpt-4o-mini"  # cheapest model
 
     use_gpt_scoring = st.sidebar.checkbox(
-        "Use GPT similarity judge",
+        "Use GPT for Summary",
         value=False,
         help="Adds semantic relevance scoring when GPT quota is available.",
     )
@@ -687,9 +685,8 @@ def main():
                     st.markdown(f"**Citation:** {case.get('citation', 'N/A')}")
                     st.markdown(f"**Court:** {case.get('court', 'N/A')}")
                     st.markdown(f"**Date:** {case.get('date', 'N/A')}")
-                    st.markdown(f"**Relevance score (Jaccard):** {sim_str}")
                     if gpt_score is not None:
-                        st.markdown(f"**Relevance score (GPT, 0–5):** {gpt_score:.2f}")
+                        st.markdown(f"**GPT Relevance score (0 – 5):** {gpt_score:.2f}")
                 with cols[1]:
                     if case.get("web_url"):
                         st.markdown(
@@ -700,7 +697,7 @@ def main():
                     st.markdown("**GPT explanation of relevance:**")
                     st.write(gpt_reason)
 
-                st.markdown("**Summary (naive, first few sentences):**")
+                st.markdown("**First few sentences of opinion:**")
                 st.write(textwrap.fill(case["summary"], width=90))
 
                 show_full = st.checkbox(
