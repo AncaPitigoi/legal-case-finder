@@ -523,7 +523,7 @@ def main():
 
     use_gpt_scoring = st.sidebar.checkbox(
         "Use GPT for Summary",
-        value=False,
+        value=True,
         help="Adds semantic relevance scoring when GPT quota is available.",
     )
 
